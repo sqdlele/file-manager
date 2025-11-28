@@ -21,30 +21,30 @@
 для автоматических изменений
 
 1. Запустить Backend:
--cd backend
--dotnet restore
--dotnet run
+cd backend
+dotnet restore
+dotnet run
 
 2. В другом терминале запустить Frontend (Vite dev server):
 
--cd backend/frontend
--npm install
--npm run dev
+cd backend/frontend
+npm install
+npm run dev
 
 Открыть: http://localhost:5173
 
 ### Режим продакшена (все на одном хосте)
 1. Собрать frontend:
 
--cd backend/frontend
--npm install
--npm run build
+cd backend/frontend
+npm install
+npm run build
 
 2. Запустить backend (он будет обслуживать и frontend):
 
--cd backend
--dotnet restore
--dotnet run
+cd backend
+dotnet restore
+dotnet run
 
 Открыть: http://localhost:5270
 
