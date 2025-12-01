@@ -12,15 +12,18 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedTaskId, setSelectedTaskId] = useState(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
+  const [showDetailsModal, setShowDetailsModal] = useState(false)
+  const [detailsTask, setDetailsTask] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [newTask, setNewTask] = useState({
     name: '',
-    type: 'fileprocessor',
+    type: 'alarm',
     parameters: {}
   })
 
   const connectionRef = useRef(null)
+  const shownNotificationsRef = useRef(new Set())
 
   const loadTasks = async () => {
     try {
@@ -82,6 +85,10 @@ function App() {
         setIsConnected(true)
       })
 
+      // Удаляем старые обработчики перед регистрацией новых (на случай переподключения)
+      newConnection.off('TaskUpdated')
+      newConnection.off('AlarmTriggered')
+
       // Подписка на обновления задач
       newConnection.on('TaskUpdated', (task) => {
         try {
@@ -97,6 +104,10 @@ function App() {
             if (index >= 0) {
               const updated = [...prevTasks]
               updated[index] = task
+              // Обновляем детали задачи, если модальное окно открыто
+              if (showDetailsModal && detailsTask && detailsTask.id === task.id) {
+                setDetailsTask(task)
+              }
               return updated
             } else {
               return [task, ...prevTasks]
@@ -111,11 +122,25 @@ function App() {
       // Подписка на срабатывание будильника
       newConnection.on('AlarmTriggered', (alarmData) => {
         try {
+          // Проверяем, не показывали ли мы уже это уведомление
+          const notificationKey = `${alarmData.taskId}-${alarmData.triggeredAt}`
+          if (shownNotificationsRef.current.has(notificationKey)) {
+            return // Уже показывали это уведомление
+          }
+          shownNotificationsRef.current.add(notificationKey)
+          
+          // Очищаем старые записи (оставляем только последние 100)
+          if (shownNotificationsRef.current.size > 100) {
+            const firstKey = shownNotificationsRef.current.values().next().value
+            shownNotificationsRef.current.delete(firstKey)
+          }
+
           if ('Notification' in window && Notification.permission === 'granted') {
             new Notification(alarmData.taskName, {
               body: alarmData.message,
               icon: '/vite.svg',
-              tag: alarmData.taskId
+              tag: alarmData.taskId, // Браузер сам фильтрует дубликаты с одинаковым tag
+              requireInteraction: false
             })
           } else if ('Notification' in window && Notification.permission !== 'denied') {
             Notification.requestPermission().then(permission => {
@@ -123,7 +148,8 @@ function App() {
                 new Notification(alarmData.taskName, {
                   body: alarmData.message,
                   icon: '/vite.svg',
-                  tag: alarmData.taskId
+                  tag: alarmData.taskId,
+                  requireInteraction: false
                 })
               }
             }).catch(err => console.error('Notification error:', err))
@@ -150,19 +176,23 @@ function App() {
     }
   }, [])
 
+  // Обновляем детали задачи при обновлении через SignalR
+  useEffect(() => {
+    if (showDetailsModal && detailsTask) {
+      const updatedTask = tasks.find(t => t && t.id === detailsTask.id)
+      if (updatedTask) {
+        setDetailsTask(updatedTask)
+      }
+    }
+  }, [tasks, showDetailsModal, detailsTask])
+
 
   const handleCreateTask = async (e) => {
     e.preventDefault()
     try {
       const params = {}
       
-      if (newTask.type === 'fileprocessor') {
-        params.fileCount = newTask.parameters.fileCount || '10'
-        params.delayMs = newTask.parameters.delayMs || '1000'
-      } else if (newTask.type === 'datagenerator') {
-        params.itemCount = newTask.parameters.itemCount || '50'
-        params.delayMs = newTask.parameters.delayMs || '300'
-      } else if (newTask.type === 'alarm') {
+      if (newTask.type === 'alarm') {
         const hours = parseFloat(newTask.parameters.hours || '0')
         const minutes = parseFloat(newTask.parameters.minutes || '0')
         const totalMs = (hours * 60 * 60 + minutes * 60) * 1000
@@ -170,9 +200,32 @@ function App() {
         params.alarmTime = alarmTime.toISOString()
         params.message = newTask.parameters.message || 'Время пришло!'
       } else if (newTask.type === 'scheduler') {
-        params.intervalSeconds = newTask.parameters.intervalSeconds || '60'
-        params.executionCount = newTask.parameters.executionCount || '10'
-        params.command = newTask.parameters.command || 'echo "Task executed"'
+        const executablePath = (newTask.parameters.executablePath || '').trim()
+        if (!executablePath) {
+          alert('Укажите путь к исполняемому файлу')
+          return
+        }
+        params.executablePath = executablePath
+        params.arguments = newTask.parameters.arguments || ''
+        params.workingDirectory = newTask.parameters.workingDirectory || ''
+        params.scheduleMode = newTask.parameters.scheduleMode || 'interval'
+        
+        if (params.scheduleMode === 'interval') {
+          params.intervalSeconds = newTask.parameters.intervalSeconds || '60'
+          params.executionCount = newTask.parameters.executionCount || '10'
+        } else {
+          params.delayBeforeStart = newTask.parameters.delayBeforeStart || '0'
+          params.runDuration = newTask.parameters.runDuration || '60'
+        }
+      } else if (newTask.type === 'process') {
+        const executablePath = (newTask.parameters.executablePath || '').trim()
+        if (!executablePath) {
+          alert('Укажите путь к исполняемому файлу')
+          return
+        }
+        params.executablePath = executablePath
+        params.arguments = newTask.parameters.arguments || ''
+        params.workingDirectory = newTask.parameters.workingDirectory || ''
       }
 
       const response = await fetch(API_URL, {
@@ -190,7 +243,7 @@ function App() {
       if (response.ok) {
         // Не добавляем задачу вручную - SignalR обновит список автоматически
         // const task = await response.json() // Не нужен, так как SignalR пришлет обновление
-        setNewTask({ name: '', type: 'fileprocessor', parameters: {} })
+        setNewTask({ name: '', type: 'alarm', parameters: {} })
         setShowCreateModal(false)
       } else {
         const errorText = await response.text()
@@ -243,11 +296,10 @@ function App() {
 
   const getTaskTypeText = (type) => {
     const typeMap = {
-      'fileprocessor': 'Обработка файлов',
-      'datagenerator': 'Генератор данных',
       'alarm': 'Будильник',
       'reminder': 'Напоминание',
-      'scheduler': 'Планировщик задач'
+      'scheduler': 'Планировщик задач',
+      'process': 'Запуск процесса'
     }
     return typeMap[type] || type
   }
@@ -428,13 +480,51 @@ function App() {
                   <tr 
                     key={task.id}
                     className={selectedTaskId === task.id ? 'selected' : ''}
-                    onClick={() => setSelectedTaskId(task.id)}
+                    onClick={() => {
+                      setSelectedTaskId(task.id)
+                      setDetailsTask(task)
+                      setShowDetailsModal(true)
+                    }}
                   >
                     <td>
                       <div style={{ fontWeight: 500 }}>{task.name || '-'}</div>
-                      {task.message && (
-                        <div style={{ fontSize: '11px', color: '#808080', marginTop: '2px' }}>
-                          {task.message}
+                      {task.type === 'process' && (task.status === 'Running' || task.status === 1) && (task.cpuUsage !== undefined || task.memoryUsage !== undefined || task.processId) && (
+                        <div style={{ 
+                          fontSize: '11px', 
+                          color: '#4ec9b0', 
+                          marginTop: '4px',
+                          display: 'flex',
+                          gap: '12px',
+                          flexWrap: 'wrap'
+                        }}>
+                          {task.processId && (
+                            <span>PID: {task.processId}</span>
+                          )}
+                          {task.cpuUsage !== undefined && task.cpuUsage !== null && (
+                            <span>CPU: {Number(task.cpuUsage).toFixed(1)}%</span>
+                          )}
+                          {task.memoryUsage !== undefined && task.memoryUsage !== null && (
+                            <span>Память: {(Number(task.memoryUsage) / 1024 / 1024).toFixed(1)} МБ</span>
+                          )}
+                        </div>
+                      )}
+                      {task.errorMessage && (
+                        <div style={{ 
+                          fontSize: '11px', 
+                          color: task.errorMessage.includes('ПРАВА АДМИНИСТРАТОРА') || task.errorMessage.includes('администратора') ? '#ffa500' : '#d13438', 
+                          marginTop: '4px',
+                          padding: '4px 8px',
+                          background: task.errorMessage.includes('ПРАВА АДМИНИСТРАТОРА') || task.errorMessage.includes('администратора') 
+                            ? 'rgba(255, 165, 0, 0.15)' 
+                            : 'rgba(209, 52, 56, 0.1)',
+                          borderRadius: '3px',
+                          border: `1px solid ${task.errorMessage.includes('ПРАВА АДМИНИСТРАТОРА') || task.errorMessage.includes('администратора') 
+                            ? 'rgba(255, 165, 0, 0.4)' 
+                            : 'rgba(209, 52, 56, 0.3)'}`,
+                          whiteSpace: 'pre-wrap',
+                          wordBreak: 'break-word'
+                        }}>
+                          <strong>{task.errorMessage.includes('ПРАВА АДМИНИСТРАТОРА') || task.errorMessage.includes('администратора') ? '⚠️ Предупреждение:' : 'Ошибка:'}</strong> {task.errorMessage}
                         </div>
                       )}
                     </td>
@@ -568,79 +658,12 @@ function App() {
                     value={newTask.type}
                     onChange={(e) => setNewTask({ ...newTask, type: e.target.value, parameters: {} })}
                   >
-                    <option value="fileprocessor">Обработка файлов</option>
-                    <option value="datagenerator">Генератор данных</option>
                     <option value="alarm">Будильник</option>
                     <option value="scheduler">Планировщик задач</option>
+                    <option value="process">Запуск процесса</option>
                   </select>
                 </div>
 
-
-                {newTask.type === 'fileprocessor' && (
-                  <div className="form-group">
-                    <div className="form-row">
-                      <div>
-                        <label>Количество файлов:</label>
-                        <input
-                          type="number"
-                          value={newTask.parameters.fileCount ?? ''}
-                          onChange={(e) => setNewTask({
-                            ...newTask,
-                            parameters: { ...newTask.parameters, fileCount: e.target.value }
-                          })}
-                          min="1"
-                          placeholder="10"
-                        />
-                      </div>
-                      <div>
-                        <label>Задержка (мс):</label>
-                        <input
-                          type="number"
-                          value={newTask.parameters.delayMs ?? ''}
-                          onChange={(e) => setNewTask({
-                            ...newTask,
-                            parameters: { ...newTask.parameters, delayMs: e.target.value }
-                          })}
-                          min="100"
-                          placeholder="1000"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {newTask.type === 'datagenerator' && (
-                  <div className="form-group">
-                    <div className="form-row">
-                      <div>
-                        <label>Количество элементов:</label>
-                        <input
-                          type="number"
-                          value={newTask.parameters.itemCount ?? ''}
-                          onChange={(e) => setNewTask({
-                            ...newTask,
-                            parameters: { ...newTask.parameters, itemCount: e.target.value }
-                          })}
-                          min="1"
-                          placeholder="50"
-                        />
-                      </div>
-                      <div>
-                        <label>Задержка (мс):</label>
-                        <input
-                          type="number"
-                          value={newTask.parameters.delayMs ?? ''}
-                          onChange={(e) => setNewTask({
-                            ...newTask,
-                            parameters: { ...newTask.parameters, delayMs: e.target.value }
-                          })}
-                          min="100"
-                          placeholder="300"
-                        />
-                      </div>
-                    </div>
-                  </div>
-                )}
 
                 {newTask.type === 'alarm' && (
                   <div className="form-group">
@@ -679,59 +702,180 @@ function App() {
                     <label style={{ marginTop: '12px' }}>Сообщение:</label>
                     <input
                       type="text"
-                      value={newTask.parameters.message || 'Время пришло!'}
+                      value={newTask.parameters.message ?? ''}
                       onChange={(e) => setNewTask({
                         ...newTask,
                         parameters: { ...newTask.parameters, message: e.target.value }
                       })}
-                      placeholder="Введите сообщение для будильника"
+                      placeholder="Время пришло!"
                     />
                   </div>
                 )}
 
                 {newTask.type === 'scheduler' && (
                   <div className="form-group">
-                    <div className="form-row">
-                      <div>
-                        <label>Интервал (секунды):</label>
-                        <input
-                          type="number"
-                          value={newTask.parameters.intervalSeconds ?? ''}
-                          onChange={(e) => setNewTask({
-                            ...newTask,
-                            parameters: { ...newTask.parameters, intervalSeconds: e.target.value }
-                          })}
-                          min="1"
-                          step="1"
-                          placeholder="60"
-                        />
-                      </div>
-                      <div>
-                        <label>Количество выполнений:</label>
-                        <input
-                          type="number"
-                          value={newTask.parameters.executionCount ?? ''}
-                          onChange={(e) => setNewTask({
-                            ...newTask,
-                            parameters: { ...newTask.parameters, executionCount: e.target.value }
-                          })}
-                          min="1"
-                          step="1"
-                          placeholder="10"
-                        />
-                      </div>
-                    </div>
-                    <label style={{ marginTop: '12px' }}>Команда (имитация):</label>
-                    <input
-                      type="text"
-                      value={newTask.parameters.command || 'echo "Task executed"'}
+                    <label>Режим работы:</label>
+                    <select
+                      value={newTask.parameters.scheduleMode || 'interval'}
                       onChange={(e) => setNewTask({
                         ...newTask,
-                        parameters: { ...newTask.parameters, command: e.target.value }
+                        parameters: { ...newTask.parameters, scheduleMode: e.target.value }
                       })}
-                      placeholder="Введите команду для выполнения"
+                    >
+                      <option value="interval">Повторяющийся запуск (через интервалы)</option>
+                      <option value="delayed">Запуск с задержкой и авто-закрытие</option>
+                    </select>
+                    <small>Выберите режим работы планировщика</small>
+                    
+                    <label style={{ marginTop: '12px' }}>Путь к исполняемому файлу:</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.executablePath ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, executablePath: e.target.value }
+                      })}
+                      placeholder="C:\\Windows\\System32\\notepad.exe"
                     />
-                    <small>Планировщик будет выполнять команду через указанные интервалы</small>
+                    <small>Полный путь к .exe файлу или имя программы из PATH</small>
+                    
+                    <label style={{ marginTop: '12px' }}>Аргументы (необязательно):</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.arguments ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, arguments: e.target.value }
+                      })}
+                      placeholder="C:\\path\\to\\file.txt"
+                    />
+                    <small>Аргументы командной строки для передачи программе</small>
+                    
+                    <label style={{ marginTop: '12px' }}>Рабочая директория (необязательно):</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.workingDirectory ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, workingDirectory: e.target.value }
+                      })}
+                      placeholder="C:\\WorkingDirectory"
+                    />
+                    <small>Директория, в которой будет запущена программа</small>
+                    
+                    {newTask.parameters.scheduleMode === 'interval' ? (
+                      <>
+                        <div className="form-row" style={{ marginTop: '12px' }}>
+                          <div>
+                            <label>Интервал (секунды):</label>
+                            <input
+                              type="number"
+                              value={newTask.parameters.intervalSeconds ?? ''}
+                              onChange={(e) => setNewTask({
+                                ...newTask,
+                                parameters: { ...newTask.parameters, intervalSeconds: e.target.value }
+                              })}
+                              min="1"
+                              step="1"
+                              placeholder="60"
+                            />
+                          </div>
+                          <div>
+                            <label>Количество выполнений:</label>
+                            <input
+                              type="number"
+                              value={newTask.parameters.executionCount ?? ''}
+                              onChange={(e) => setNewTask({
+                                ...newTask,
+                                parameters: { ...newTask.parameters, executionCount: e.target.value }
+                              })}
+                              min="1"
+                              step="1"
+                              placeholder="10"
+                            />
+                          </div>
+                        </div>
+                        <small style={{ marginTop: '8px', display: 'block' }}>
+                          Программа будет запускаться через указанные интервалы указанное количество раз
+                        </small>
+                      </>
+                    ) : (
+                      <>
+                        <div className="form-row" style={{ marginTop: '12px' }}>
+                          <div>
+                            <label>Задержка перед запуском (секунды):</label>
+                            <input
+                              type="number"
+                              value={newTask.parameters.delayBeforeStart ?? ''}
+                              onChange={(e) => setNewTask({
+                                ...newTask,
+                                parameters: { ...newTask.parameters, delayBeforeStart: e.target.value }
+                              })}
+                              min="0"
+                              step="1"
+                              placeholder="0"
+                            />
+                          </div>
+                          <div>
+                            <label>Время работы программы (секунды):</label>
+                            <input
+                              type="number"
+                              value={newTask.parameters.runDuration ?? ''}
+                              onChange={(e) => setNewTask({
+                                ...newTask,
+                                parameters: { ...newTask.parameters, runDuration: e.target.value }
+                              })}
+                              min="1"
+                              step="1"
+                              placeholder="60"
+                            />
+                          </div>
+                        </div>
+                        <small style={{ marginTop: '8px', display: 'block' }}>
+                          Программа запустится через указанную задержку и автоматически закроется через указанное время
+                        </small>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {newTask.type === 'process' && (
+                  <div className="form-group">
+                    <label>Путь к исполняемому файлу:</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.executablePath ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, executablePath: e.target.value }
+                      })}
+                      placeholder="C:\\Windows\\System32\\notepad.exe"
+                    />
+                    <small>Полный путь к .exe файлу или имя программы из PATH</small>
+                    
+                    <label style={{ marginTop: '12px' }}>Аргументы (необязательно):</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.arguments ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, arguments: e.target.value }
+                      })}
+                      placeholder="C:\\path\\to\\file.txt"
+                    />
+                    <small>Аргументы командной строки для передачи процессу</small>
+                    
+                    <label style={{ marginTop: '12px' }}>Рабочая директория (необязательно):</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.workingDirectory ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, workingDirectory: e.target.value }
+                      })}
+                      placeholder="C:\\WorkingDirectory"
+                    />
+                    <small>Директория, в которой будет запущен процесс</small>
                   </div>
                 )}
 
@@ -745,6 +889,135 @@ function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Модальное окно с деталями задачи */}
+      {showDetailsModal && detailsTask && (
+        <div className="modal-overlay" onClick={() => setShowDetailsModal(false)}>
+          <div className="modal-content" style={{ maxWidth: '800px', maxHeight: '90vh', overflow: 'auto' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Детали задачи: {detailsTask.name}</h2>
+              <button className="close-button" onClick={() => setShowDetailsModal(false)}>×</button>
+            </div>
+
+            <div className="modal-body" style={{ padding: '20px' }}>
+              {/* Общая информация */}
+              <div style={{ marginBottom: '24px' }}>
+                <h3 style={{ marginBottom: '12px', color: '#4ec9b0' }}>Общая информация</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', fontSize: '14px' }}>
+                  <div>
+                    <strong>Тип:</strong> {getTaskTypeText(detailsTask.type)}
+                  </div>
+                  <div>
+                    <strong>Статус:</strong> <span className={`status-badge ${getStatusClass(detailsTask.status || 'Pending')}`}>
+                      {getStatusText(detailsTask.status || 'Pending')}
+                    </span>
+                  </div>
+                  <div>
+                    <strong>Создана:</strong> {formatTime(detailsTask.createdAt)}
+                  </div>
+                  {detailsTask.startedAt && (
+                    <div>
+                      <strong>Запущена:</strong> {formatTime(detailsTask.startedAt)}
+                    </div>
+                  )}
+                  {detailsTask.completedAt && (
+                    <div>
+                      <strong>Завершена:</strong> {formatTime(detailsTask.completedAt)}
+                    </div>
+                  )}
+                  {detailsTask.processId && (
+                    <div>
+                      <strong>PID:</strong> {detailsTask.processId}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Для процессов - детальная информация */}
+              {detailsTask.type === 'process' && (
+                <>
+                  <div style={{ marginBottom: '24px' }}>
+                    <h3 style={{ marginBottom: '12px', color: '#4ec9b0' }}>Метрики процесса</h3>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', fontSize: '14px' }}>
+                      {detailsTask.cpuUsage !== undefined && detailsTask.cpuUsage !== null && (
+                        <div>
+                          <strong>CPU:</strong> {Number(detailsTask.cpuUsage).toFixed(2)}%
+                        </div>
+                      )}
+                      {detailsTask.memoryUsage !== undefined && detailsTask.memoryUsage !== null && (
+                        <div>
+                          <strong>Память:</strong> {(Number(detailsTask.memoryUsage) / 1024 / 1024).toFixed(2)} МБ
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: '24px' }}>
+                    <h3 style={{ marginBottom: '12px', color: '#4ec9b0' }}>Информация о процессе</h3>
+                    <div style={{ fontSize: '14px', background: '#1e1e1e', padding: '12px', borderRadius: '4px' }}>
+                      <div style={{ marginBottom: '8px' }}>
+                        <strong>Статус процесса:</strong><br />
+                        <span style={{ color: '#4ec9b0' }}>
+                          {detailsTask.status === 'Running' || detailsTask.status === 1 
+                            ? 'Запущен и работает' 
+                            : detailsTask.status === 'Completed' || detailsTask.status === 2
+                            ? 'Завершен успешно'
+                            : detailsTask.status === 'Failed' || detailsTask.status === 3
+                            ? 'Завершен с ошибкой'
+                            : 'Не запущен'}
+                        </span>
+                      </div>
+                      {detailsTask.processId && (
+                        <div style={{ marginTop: '8px' }}>
+                          <strong>Идентификатор процесса (PID):</strong><br />
+                          <code style={{ color: '#4ec9b0' }}>{detailsTask.processId}</code>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {/* Ошибка */}
+              {detailsTask.errorMessage && (
+                <div style={{ marginBottom: '24px' }}>
+                  <h3 style={{ marginBottom: '12px', color: '#d13438' }}>Ошибка</h3>
+                  <div style={{ 
+                    background: 'rgba(209, 52, 56, 0.1)', 
+                    padding: '12px', 
+                    borderRadius: '4px',
+                    border: '1px solid rgba(209, 52, 56, 0.3)',
+                    fontSize: '14px',
+                    whiteSpace: 'pre-wrap',
+                    wordBreak: 'break-word',
+                    color: '#d13438'
+                  }}>
+                    {detailsTask.errorMessage}
+                  </div>
+                </div>
+              )}
+
+              {/* Прогресс */}
+              {detailsTask.maxValue && (
+                <div style={{ marginBottom: '24px' }}>
+                  <h3 style={{ marginBottom: '12px', color: '#4ec9b0' }}>Прогресс</h3>
+                  <div style={{ fontSize: '14px' }}>
+                    {detailsTask.maxValue 
+                      ? `${detailsTask.progress || 0} / ${detailsTask.maxValue}`
+                      : `${detailsTask.progress || 0}%`}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="modal-footer">
+              <button type="button" className="toolbar-button" onClick={() => setShowDetailsModal(false)}>
+                Закрыть
+              </button>
+            </div>
           </div>
         </div>
       )}

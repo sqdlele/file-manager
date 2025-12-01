@@ -13,5 +13,10 @@ public class BackgroundTask
     public int Progress { get; set; } = 0;
     public int? MaxValue { get; set; }
     public string? Message { get; set; }
+    
+    // Метрики процесса (для типа "process")
+    public double? CpuUsage { get; set; } // Процент использования CPU
+    public long? MemoryUsage { get; set; } // Использование памяти в байтах
+    public int? ProcessId { get; set; } // PID процесса
 }
 
