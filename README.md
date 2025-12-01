@@ -1,7 +1,7 @@
 # Менеджер фоновых задач
 
 ## Технологии
- **Backend**: ASP.NET 9.0 с SignalR
+ **Backend**: ASP.NET 9.0 с SignalR (Windows Runtime для системных уведомлений)
  **Frontend**: React 19 + Vite
 
 ### Зависимости проекта:
@@ -48,6 +48,15 @@ dotnet restore
 dotnet run
 
 Открыть: http://localhost:5270
+
+## Особенности
+
+### Системные уведомления Windows
+При срабатывании будильника уведомления показываются:
+- В браузере (через Web Notifications API)
+- На рабочем столе Windows (через Windows Toast Notifications)
+
+
 
 
 
