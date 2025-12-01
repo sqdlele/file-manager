@@ -21,7 +21,6 @@
 для автоматических изменений
 
 1. Запустить Backend:
-
 cd backend
 dotnet restore
 dotnet run
