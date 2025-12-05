@@ -49,10 +49,7 @@ dotnet run
 
 Открыть: http://localhost:5270
 
-## Особенности
-
 ### Системные уведомления Windows
-При срабатывании будильника уведомления показываются:
 - В браузере (через Web Notifications API)
 - На рабочем столе Windows (через Windows Toast Notifications)
 - RabbitMQ для отправки и получения сообщений через очереди.
