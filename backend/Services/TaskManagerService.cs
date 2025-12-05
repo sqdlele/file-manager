@@ -1062,7 +1062,7 @@ public class TaskManagerService : ITaskManagerService
             _logger.LogInformation("Задача {TaskId} начала слушать очередь RabbitMQ '{QueueName}'", task.Id, queueName);
 
             var consumer = new EventingBasicConsumer(channel);
-            var messagesReceived = 0;
+            var messagesReceived = 0; // Используем Interlocked для потокобезопасного инкремента
 
             consumer.Received += async (model, ea) =>
             {
@@ -1073,14 +1073,16 @@ public class TaskManagerService : ITaskManagerService
                     
                     var body = ea.Body.ToArray();
                     var message = Encoding.UTF8.GetString(body);
-                    messagesReceived++;
+                    
+                    // Потокобезопасный инкремент счетчика
+                    var currentCount = Interlocked.Increment(ref messagesReceived);
 
                     _logger.LogInformation("Задача {TaskId} получила сообщение из очереди '{QueueName}': {Message}", 
                         task.Id, queueName, message);
 
                     // Обновляем счетчик полученных сообщений
-                    task.Progress = messagesReceived;
-                    task.Message = $"Получено сообщений: {messagesReceived} из очереди '{queueName}'";
+                    task.Progress = currentCount;
+                    task.Message = $"Получено сообщений: {currentCount} из очереди '{queueName}'";
                     await NotifyTaskUpdateAsync(task);
 
                     // Создаем уведомление о получении сообщения
@@ -1092,7 +1094,7 @@ public class TaskManagerService : ITaskManagerService
                         {
                             { "queueName", queueName },
                             { "taskId", task.Id },
-                            { "messageNumber", messagesReceived }
+                            { "messageNumber", currentCount }
                         }
                     );
 
