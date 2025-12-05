@@ -23,6 +23,13 @@ builder.Services.AddSignalR(options =>
 // Add services
 builder.Services.AddSingleton<ITaskManagerService, TaskManagerService>();
 
+// Add Notification service
+builder.Services.AddSingleton<INotificationService, NotificationService>();
+
+// Add RabbitMQ services
+builder.Services.AddSingleton<IRabbitMqService, RabbitMqService>();
+builder.Services.AddHostedService<RabbitMqConsumerService>();
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline

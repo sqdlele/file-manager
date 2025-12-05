@@ -60,6 +60,26 @@ public class TasksController : ControllerBase
         return Ok(new { message = "Task stopped successfully" });
     }
 
+    [HttpPost("{id}/pause")]
+    public async Task<ActionResult> PauseTask(string id)
+    {
+        var paused = await _taskManagerService.PauseTaskAsync(id);
+        if (!paused)
+            return NotFound(new { error = "Task not found or cannot be paused" });
+
+        return Ok(new { message = "Task paused successfully" });
+    }
+
+    [HttpPost("{id}/resume")]
+    public async Task<ActionResult> ResumeTask(string id)
+    {
+        var resumed = await _taskManagerService.ResumeTaskAsync(id);
+        if (!resumed)
+            return NotFound(new { error = "Task not found or cannot be resumed" });
+
+        return Ok(new { message = "Task resumed successfully" });
+    }
+
     [HttpDelete("{id}")]
     public async Task<ActionResult> DeleteTask(string id)
     {

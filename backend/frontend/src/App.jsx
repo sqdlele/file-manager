@@ -3,10 +3,14 @@ import * as signalR from '@microsoft/signalr'
 import './App.css'
 
 const API_URL = '/api/tasks'
+const NOTIFICATIONS_API_URL = '/api/notifications'
 const HUB_URL = '/taskhub'
 
 function App() {
   const [tasks, setTasks] = useState([])
+  const [notifications, setNotifications] = useState([])
+  const [unreadCount, setUnreadCount] = useState(0)
+  const [activeTab, setActiveTab] = useState('tasks') // 'tasks' или 'notifications'
   const [connection, setConnection] = useState(null)
   const [isConnected, setIsConnected] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -48,14 +52,83 @@ function App() {
     }
   }
 
+  const loadNotifications = async () => {
+    try {
+      const response = await fetch(NOTIFICATIONS_API_URL)
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`)
+      }
+      const data = await response.json()
+      const notificationsArray = Array.isArray(data) ? data : []
+      setNotifications(notificationsArray)
+      
+      // Загружаем счетчик непрочитанных
+      const countResponse = await fetch(`${NOTIFICATIONS_API_URL}/unread/count`)
+      if (countResponse.ok) {
+        const countData = await countResponse.json()
+        setUnreadCount(countData.count || 0)
+      }
+    } catch (error) {
+      console.error('Error loading notifications:', error)
+    }
+  }
+
+  const markAsRead = async (notificationId) => {
+    try {
+      const response = await fetch(`${NOTIFICATIONS_API_URL}/${notificationId}/read`, {
+        method: 'POST'
+      })
+      if (response.ok) {
+        setNotifications(prev => prev.map(n => 
+          n.id === notificationId ? { ...n, isRead: true } : n
+        ))
+        setUnreadCount(prev => Math.max(0, prev - 1))
+      }
+    } catch (error) {
+      console.error('Error marking notification as read:', error)
+    }
+  }
+
+  const markAllAsRead = async () => {
+    try {
+      const response = await fetch(`${NOTIFICATIONS_API_URL}/read-all`, {
+        method: 'POST'
+      })
+      if (response.ok) {
+        setNotifications(prev => prev.map(n => ({ ...n, isRead: true })))
+        setUnreadCount(0)
+      }
+    } catch (error) {
+      console.error('Error marking all as read:', error)
+    }
+  }
+
+  const deleteNotification = async (notificationId) => {
+    try {
+      const response = await fetch(`${NOTIFICATIONS_API_URL}/${notificationId}`, {
+        method: 'DELETE'
+      })
+      if (response.ok) {
+        setNotifications(prev => prev.filter(n => n.id !== notificationId))
+        // Обновляем счетчик
+        const updated = notifications.filter(n => n.id !== notificationId)
+        const newUnreadCount = updated.filter(n => !n.isRead).length
+        setUnreadCount(newUnreadCount)
+      }
+    } catch (error) {
+      console.error('Error deleting notification:', error)
+    }
+  }
+
   useEffect(() => {
     // Запрашиваем разрешение на уведомления при загрузке
     if ('Notification' in window && Notification.permission === 'default') {
       Notification.requestPermission().catch(err => console.error('Notification permission error:', err))
     }
 
-    // Загрузка задач сначала
+    // Загрузка задач и уведомлений
     loadTasks()
+    loadNotifications()
 
     // Инициализация SignalR подключения
     let newConnection
@@ -88,6 +161,9 @@ function App() {
       // Удаляем старые обработчики перед регистрацией новых (на случай переподключения)
       newConnection.off('TaskUpdated')
       newConnection.off('AlarmTriggered')
+      newConnection.off('NotificationReceived')
+      newConnection.off('NotificationUpdated')
+      newConnection.off('NotificationCountUpdated')
 
       // Подписка на обновления задач
       newConnection.on('TaskUpdated', (task) => {
@@ -160,6 +236,44 @@ function App() {
           console.error('Error handling alarm:', err)
         }
       })
+
+      // Подписка на уведомления
+      newConnection.on('NotificationReceived', (notification) => {
+        try {
+          setNotifications(prev => [notification, ...prev])
+          setUnreadCount(prev => prev + 1)
+          
+          // Показываем браузерное уведомление
+          if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification(notification.title, {
+              body: notification.message,
+              icon: '/vite.svg',
+              tag: notification.id,
+              requireInteraction: false
+            })
+          }
+        } catch (err) {
+          console.error('Error handling notification:', err)
+        }
+      })
+
+      newConnection.on('NotificationUpdated', (notification) => {
+        try {
+          setNotifications(prev => prev.map(n => 
+            n.id === notification.id ? notification : n
+          ))
+        } catch (err) {
+          console.error('Error updating notification:', err)
+        }
+      })
+
+      newConnection.on('NotificationCountUpdated', (count) => {
+        try {
+          setUnreadCount(count || 0)
+        } catch (err) {
+          console.error('Error updating notification count:', err)
+        }
+      })
     } catch (err) {
       console.error('Error setting up SignalR:', err)
       setIsConnected(false)
@@ -226,6 +340,37 @@ function App() {
         params.executablePath = executablePath
         params.arguments = newTask.parameters.arguments || ''
         params.workingDirectory = newTask.parameters.workingDirectory || ''
+      } else if (newTask.type === 'rabbitmq') {
+        const queueName = (newTask.parameters.queueName || '').trim()
+        const message = (newTask.parameters.message || '').trim()
+        if (!queueName) {
+          alert('Укажите имя очереди')
+          return
+        }
+        if (!message) {
+          alert('Укажите сообщение для отправки')
+          return
+        }
+        params.queueName = queueName
+        params.message = message
+        
+        // Параметры для повторной отправки
+        const executionCount = parseInt(newTask.parameters.executionCount || '1', 10)
+        const intervalSeconds = parseInt(newTask.parameters.intervalSeconds || '0', 10)
+        
+        if (executionCount > 1) {
+          params.executionCount = executionCount.toString()
+          if (intervalSeconds > 0) {
+            params.intervalSeconds = intervalSeconds.toString()
+          }
+        }
+      } else if (newTask.type === 'rabbitmq_consumer') {
+        const queueName = (newTask.parameters.queueName || '').trim()
+        if (!queueName) {
+          alert('Укажите имя очереди для прослушивания')
+          return
+        }
+        params.queueName = queueName
       }
 
       const response = await fetch(API_URL, {
@@ -271,6 +416,38 @@ function App() {
     }
   }
 
+  const handlePauseTask = async (taskId) => {
+    try {
+      const response = await fetch(`${API_URL}/${taskId}/pause`, {
+        method: 'POST'
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Неизвестная ошибка' }))
+        alert(errorData.error || 'Не удалось приостановить задачу')
+      }
+    } catch (error) {
+      console.error('Error pausing task:', error)
+      alert('Ошибка при приостановке задачи')
+    }
+  }
+
+  const handleResumeTask = async (taskId) => {
+    try {
+      const response = await fetch(`${API_URL}/${taskId}/resume`, {
+        method: 'POST'
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Неизвестная ошибка' }))
+        alert(errorData.error || 'Не удалось возобновить задачу')
+      }
+    } catch (error) {
+      console.error('Error resuming task:', error)
+      alert('Ошибка при возобновлении задачи')
+    }
+  }
+
   const handleDeleteTask = async (taskId) => {
     if (!confirm('Вы уверены, что хотите удалить эту задачу?')) {
       return
@@ -299,7 +476,8 @@ function App() {
       'alarm': 'Будильник',
       'reminder': 'Напоминание',
       'scheduler': 'Планировщик задач',
-      'process': 'Запуск процесса'
+      'process': 'Запуск процесса',
+      'rabbitmq': 'Отправить в RabbitMQ'
     }
     return typeMap[type] || type
   }
@@ -310,17 +488,20 @@ function App() {
       // Числовые значения (enum)
       0: 'Ожидание',
       1: 'Выполняется',
-      2: 'Завершена',
-      3: 'Ошибка',
-      4: 'Отменена',
+      2: 'Приостановлена',
+      3: 'Завершена',
+      4: 'Ошибка',
+      5: 'Отменена',
       // Строковые значения (на случай если backend вернет строку)
       '0': 'Ожидание',
       '1': 'Выполняется',
-      '2': 'Завершена',
-      '3': 'Ошибка',
-      '4': 'Отменена',
+      '2': 'Приостановлена',
+      '3': 'Завершена',
+      '4': 'Ошибка',
+      '5': 'Отменена',
       'Pending': 'Ожидание',
       'Running': 'Выполняется',
+      'Paused': 'Приостановлена',
       'Completed': 'Завершена',
       'Failed': 'Ошибка',
       'Cancelled': 'Отменена'
@@ -336,16 +517,19 @@ function App() {
     const statusClassMap = {
       0: 'pending',
       1: 'running',
-      2: 'completed',
-      3: 'failed',
-      4: 'cancelled',
+      2: 'paused',
+      3: 'completed',
+      4: 'failed',
+      5: 'cancelled',
       '0': 'pending',
       '1': 'running',
-      '2': 'completed',
-      '3': 'failed',
-      '4': 'cancelled',
+      '2': 'paused',
+      '3': 'completed',
+      '4': 'failed',
+      '5': 'cancelled',
       'Pending': 'pending',
       'Running': 'running',
+      'Paused': 'paused',
       'Completed': 'completed',
       'Failed': 'failed',
       'Cancelled': 'cancelled'
@@ -400,6 +584,22 @@ function App() {
     }
   })()
 
+  const formatNotificationDate = (dateString) => {
+    if (!dateString) return '-'
+    const date = new Date(dateString)
+    const now = new Date()
+    const diffMs = now - date
+    const diffMins = Math.floor(diffMs / 60000)
+    const diffHours = Math.floor(diffMs / 3600000)
+    const diffDays = Math.floor(diffMs / 86400000)
+
+    if (diffMins < 1) return 'только что'
+    if (diffMins < 60) return `${diffMins} мин. назад`
+    if (diffHours < 24) return `${diffHours} ч. назад`
+    if (diffDays < 7) return `${diffDays} дн. назад`
+    return date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })
+  }
+
   return (
     <div className="app">
       {/* Заголовок окна */}
@@ -407,7 +607,30 @@ function App() {
         <div className="window-title">Диспетчер задач</div>
       </div>
 
+      {/* Табы */}
+      <div className="tabs-container">
+        <button 
+          className={`tab-button ${activeTab === 'tasks' ? 'active' : ''}`}
+          onClick={() => setActiveTab('tasks')}
+        >
+          Задачи
+        </button>
+        <button 
+          className={`tab-button ${activeTab === 'notifications' ? 'active' : ''}`}
+          onClick={() => {
+            setActiveTab('notifications')
+            loadNotifications()
+          }}
+        >
+          Уведомления
+          {unreadCount > 0 && (
+            <span className="unread-badge">{unreadCount > 99 ? '99+' : unreadCount}</span>
+          )}
+        </button>
+      </div>
+
       {/* Панель инструментов */}
+      {activeTab === 'tasks' && (
       <div className="toolbar">
         <div className="search-box">
           <input
@@ -436,8 +659,24 @@ function App() {
           <span>{isConnected ? 'Подключено' : 'Отключено'}</span>
         </div>
       </div>
+      )}
 
-      {/* Таблица задач */}
+      {activeTab === 'notifications' && (
+      <div className="toolbar">
+        <div style={{ flex: 1 }}></div>
+        {unreadCount > 0 && (
+          <button 
+            className="toolbar-button" 
+            onClick={markAllAsRead}
+          >
+            Отметить все как прочитанные
+          </button>
+        )}
+      </div>
+      )}
+
+      {/* Контент вкладок */}
+      {activeTab === 'tasks' && (
       <div className="table-container">
         {loading ? (
           <div className="empty-state">
@@ -571,22 +810,28 @@ function App() {
                                          statusStr === '1' ||
                                          statusText === 'Выполняется'
                         
+                        const isPaused = status === 'Paused' || 
+                                        status === 2 || 
+                                        status === '2' || 
+                                        statusStr === '2' ||
+                                        statusText === 'Приостановлена'
+                        
                         const isCompleted = status === 'Completed' || 
-                                           status === 2 || 
-                                           status === '2' || 
-                                           statusStr === '2' ||
+                                           status === 3 || 
+                                           status === '3' || 
+                                           statusStr === '3' ||
                                            statusText === 'Завершена'
                         
                         const isFailed = status === 'Failed' || 
-                                        status === 3 || 
-                                        status === '3' || 
-                                        statusStr === '3' ||
+                                        status === 4 || 
+                                        status === '4' || 
+                                        statusStr === '4' ||
                                         statusText === 'Ошибка'
                         
                         const isCancelled = status === 'Cancelled' || 
-                                          status === 4 || 
-                                          status === '4' || 
-                                          statusStr === '4' ||
+                                          status === 5 || 
+                                          status === '5' || 
+                                          statusStr === '5' ||
                                           statusText === 'Отменена'
                         
                         // Можно удалять завершенные, с ошибками и отмененные задачи
@@ -594,15 +839,53 @@ function App() {
                         
                         if (isRunning) {
                           return (
-                            <button
-                              className="action-button danger"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                handleStopTask(task.id)
-                              }}
-                            >
-                              Завершить
-                            </button>
+                            <>
+                              <button
+                                className="action-button"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handlePauseTask(task.id)
+                                }}
+                                style={{ marginRight: '8px' }}
+                              >
+                                Пауза
+                              </button>
+                              <button
+                                className="action-button danger"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleStopTask(task.id)
+                                }}
+                              >
+                                Завершить
+                              </button>
+                            </>
+                          )
+                        }
+                        
+                        if (isPaused) {
+                          return (
+                            <>
+                              <button
+                                className="action-button"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleResumeTask(task.id)
+                                }}
+                                style={{ marginRight: '8px' }}
+                              >
+                                Возобновить
+                              </button>
+                              <button
+                                className="action-button danger"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleStopTask(task.id)
+                                }}
+                              >
+                                Завершить
+                              </button>
+                            </>
                           )
                         }
                         
@@ -630,6 +913,56 @@ function App() {
           </table>
         )}
       </div>
+      )}
+
+      {activeTab === 'notifications' && (
+      <div className="table-container">
+        {notifications.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-state-icon"></div>
+            <div className="empty-state-text">Нет уведомлений</div>
+          </div>
+        ) : (
+          <div className="notifications-list">
+            {notifications.map(notification => (
+              <div 
+                key={notification.id} 
+                className={`notification-item ${!notification.isRead ? 'unread' : ''}`}
+                onClick={() => {
+                  if (!notification.isRead) {
+                    markAsRead(notification.id)
+                  }
+                }}
+              >
+                <div className="notification-header">
+                  <div className="notification-title-row">
+                    <h3 className="notification-title">{notification.title}</h3>
+                    {!notification.isRead && <span className="unread-dot"></span>}
+                  </div>
+                  <div className="notification-actions">
+                    <button
+                      className="notification-action-btn"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        deleteNotification(notification.id)
+                      }}
+                      title="Удалить"
+                    >
+                      ×
+                    </button>
+                  </div>
+                </div>
+                <div className="notification-message">{notification.message}</div>
+                <div className="notification-footer">
+                  <span className="notification-source">{notification.source || 'System'}</span>
+                  <span className="notification-date">{formatNotificationDate(notification.createdAt)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      )}
 
       {/* Модальное окно создания задачи */}
       {showCreateModal && (
@@ -661,6 +994,8 @@ function App() {
                     <option value="alarm">Будильник</option>
                     <option value="scheduler">Планировщик задач</option>
                     <option value="process">Запуск процесса</option>
+                    <option value="rabbitmq">Отправить в RabbitMQ</option>
+                    <option value="rabbitmq_consumer">Слушать очередь RabbitMQ</option>
                   </select>
                 </div>
 
@@ -876,6 +1211,103 @@ function App() {
                       placeholder="C:\\WorkingDirectory"
                     />
                     <small>Директория, в которой будет запущен процесс</small>
+                  </div>
+                )}
+
+                {newTask.type === 'rabbitmq' && (
+                  <div className="form-group">
+                    <label>Имя очереди:</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.queueName ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, queueName: e.target.value }
+                      })}
+                      placeholder="test_queue"
+                      required
+                    />
+                    <small>Имя очереди RabbitMQ, в которую будет отправлено сообщение</small>
+                    
+                    <label style={{ marginTop: '12px' }}>Сообщение:</label>
+                    <textarea
+                      value={newTask.parameters.message ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, message: e.target.value }
+                      })}
+                      placeholder="Введите сообщение для отправки в очередь"
+                      rows="4"
+                      required
+                      style={{
+                        width: '100%',
+                        padding: '8px 12px',
+                        background: '#1e1e1e',
+                        border: '1px solid #3d3d3d',
+                        borderRadius: '4px',
+                        color: '#ffffff',
+                        fontSize: '13px',
+                        fontFamily: 'Segoe UI, sans-serif',
+                        resize: 'vertical',
+                        outline: 'none'
+                      }}
+                    />
+                    <small>Текст сообщения, которое будет отправлено в очередь RabbitMQ</small>
+                    
+                    <div className="form-row" style={{ marginTop: '12px' }}>
+                      <div>
+                        <label>Количество отправок:</label>
+                        <input
+                          type="number"
+                          value={newTask.parameters.executionCount ?? '1'}
+                          onChange={(e) => setNewTask({
+                            ...newTask,
+                            parameters: { ...newTask.parameters, executionCount: e.target.value }
+                          })}
+                          min="1"
+                          step="1"
+                          placeholder="1"
+                        />
+                        <small>Сколько раз отправить сообщение</small>
+                      </div>
+                      <div>
+                        <label>Интервал (секунды):</label>
+                        <input
+                          type="number"
+                          value={newTask.parameters.intervalSeconds ?? '0'}
+                          onChange={(e) => setNewTask({
+                            ...newTask,
+                            parameters: { ...newTask.parameters, intervalSeconds: e.target.value }
+                          })}
+                          min="0"
+                          step="1"
+                          placeholder="0"
+                        />
+                        <small>Пауза между отправками (0 = без паузы)</small>
+                      </div>
+                    </div>
+                    <small style={{ marginTop: '8px', display: 'block' }}>
+                      {parseInt(newTask.parameters.executionCount || '1', 10) > 1 
+                        ? `Сообщение будет отправлено ${newTask.parameters.executionCount || '1'} раз${parseInt(newTask.parameters.intervalSeconds || '0', 10) > 0 ? ` с интервалом ${newTask.parameters.intervalSeconds || '0'} секунд` : ' без паузы'}`
+                        : 'Сообщение будет отправлено один раз'}
+                    </small>
+                  </div>
+                )}
+
+                {newTask.type === 'rabbitmq_consumer' && (
+                  <div className="form-group">
+                    <label>Имя очереди для прослушивания:</label>
+                    <input
+                      type="text"
+                      value={newTask.parameters.queueName ?? ''}
+                      onChange={(e) => setNewTask({
+                        ...newTask,
+                        parameters: { ...newTask.parameters, queueName: e.target.value }
+                      })}
+                      placeholder="test_queue"
+                      required
+                    />
+                    <small>Имя очереди RabbitMQ, которую будет слушать эта задача. При получении сообщений будут создаваться уведомления.</small>
                   </div>
                 )}
 

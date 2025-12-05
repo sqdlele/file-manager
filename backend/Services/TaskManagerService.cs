@@ -6,6 +6,9 @@ using TasksManager.Api.Hubs;
 using Microsoft.AspNetCore.SignalR;
 using Windows.UI.Notifications;
 using Windows.Data.Xml.Dom;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System.Text;
 
 namespace TasksManager.Api.Services;
 
@@ -14,13 +17,26 @@ public class TaskManagerService : ITaskManagerService
     private readonly ConcurrentDictionary<string, BackgroundTask> _tasks = new();
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _cancellationTokens = new();
     private readonly ConcurrentDictionary<string, Process> _runningProcesses = new();
+    private readonly ConcurrentDictionary<string, (IConnection Connection, IModel Channel)> _rabbitMqConnections = new();
+    private readonly ConcurrentDictionary<string, ManualResetEventSlim> _pauseEvents = new();
     private readonly IHubContext<TaskHub> _hubContext;
     private readonly ILogger<TaskManagerService> _logger;
+    private readonly IRabbitMqService _rabbitMqService;
+    private readonly INotificationService _notificationService;
+    private readonly IConfiguration _configuration;
 
-    public TaskManagerService(IHubContext<TaskHub> hubContext, ILogger<TaskManagerService> logger)
+    public TaskManagerService(
+        IHubContext<TaskHub> hubContext, 
+        ILogger<TaskManagerService> logger, 
+        IRabbitMqService rabbitMqService,
+        INotificationService notificationService,
+        IConfiguration configuration)
     {
         _hubContext = hubContext;
         _logger = logger;
+        _rabbitMqService = rabbitMqService;
+        _notificationService = notificationService;
+        _configuration = configuration;
     }
 
     public async Task<string> StartTaskAsync(string name, string type, Dictionary<string, string>? parameters = null)
@@ -51,7 +67,7 @@ public class TaskManagerService : ITaskManagerService
         if (!_tasks.TryGetValue(taskId, out var task))
             return false;
 
-        if (task.Status != Models.TaskStatus.Running)
+        if (task.Status != Models.TaskStatus.Running && task.Status != Models.TaskStatus.Paused)
             return false;
 
         // Если это процесс, завершаем его
@@ -80,6 +96,24 @@ public class TaskManagerService : ITaskManagerService
             }
         }
 
+        // Если это RabbitMQ consumer, закрываем подключение
+        if (task.Type.ToLower() == "rabbitmq_consumer" && _rabbitMqConnections.TryGetValue(taskId, out var rabbitConnection))
+        {
+            try
+            {
+                rabbitConnection.Channel?.Close();
+                rabbitConnection.Channel?.Dispose();
+                rabbitConnection.Connection?.Close();
+                rabbitConnection.Connection?.Dispose();
+                _rabbitMqConnections.TryRemove(taskId, out _);
+                _logger.LogInformation("RabbitMQ подключение закрыто для задачи {TaskId}", taskId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Не удалось закрыть RabbitMQ подключение для задачи {TaskId}", taskId);
+            }
+        }
+
         if (_cancellationTokens.TryGetValue(taskId, out var cts))
         {
             cts.Cancel();
@@ -93,18 +127,64 @@ public class TaskManagerService : ITaskManagerService
         return false;
     }
 
+    public async Task<bool> PauseTaskAsync(string taskId)
+    {
+        if (!_tasks.TryGetValue(taskId, out var task))
+            return false;
+
+        if (task.Status != Models.TaskStatus.Running)
+            return false;
+
+        // Создаем или получаем событие паузы для задачи
+        var pauseEvent = _pauseEvents.GetOrAdd(taskId, _ => new ManualResetEventSlim(true)); // Изначально не на паузе
+        pauseEvent.Reset(); // Устанавливаем паузу (блокируем выполнение)
+
+        task.Status = Models.TaskStatus.Paused;
+        task.Message = "Задача приостановлена";
+        await NotifyTaskUpdateAsync(task);
+
+        _logger.LogInformation("Задача {TaskId} приостановлена", taskId);
+        return true;
+    }
+
+    public async Task<bool> ResumeTaskAsync(string taskId)
+    {
+        if (!_tasks.TryGetValue(taskId, out var task))
+            return false;
+
+        if (task.Status != Models.TaskStatus.Paused)
+            return false;
+
+        // Возобновляем выполнение
+        if (_pauseEvents.TryGetValue(taskId, out var pauseEvent))
+        {
+            pauseEvent.Set(); // Снимаем паузу (разблокируем выполнение)
+        }
+
+        task.Status = Models.TaskStatus.Running;
+        task.Message = "Задача возобновлена";
+        await NotifyTaskUpdateAsync(task);
+
+        _logger.LogInformation("Задача {TaskId} возобновлена", taskId);
+        return true;
+    }
+
     public Task<bool> DeleteTaskAsync(string taskId)
     {
         if (!_tasks.TryGetValue(taskId, out var task))
             return Task.FromResult(false);
 
-        // Нельзя удалять выполняющиеся задачи
-        if (task.Status == Models.TaskStatus.Running)
+        // Нельзя удалять выполняющиеся или приостановленные задачи
+        if (task.Status == Models.TaskStatus.Running || task.Status == Models.TaskStatus.Paused)
             return Task.FromResult(false);
 
         // Удаляем задачу из словаря
         _tasks.TryRemove(taskId, out _);
         _cancellationTokens.TryRemove(taskId, out _);
+        if (_pauseEvents.TryRemove(taskId, out var pauseEvent))
+        {
+            pauseEvent.Dispose();
+        }
 
         return Task.FromResult(true);
     }
@@ -140,6 +220,12 @@ public class TaskManagerService : ITaskManagerService
                     break;
                 case "process":
                     await RunProcessTaskAsync(task, parameters, cancellationToken);
+                    break;
+                case "rabbitmq":
+                    await RunRabbitMqTaskAsync(task, parameters, cancellationToken);
+                    break;
+                case "rabbitmq_consumer":
+                    await RunRabbitMqConsumerTaskAsync(task, parameters, cancellationToken);
                     break;
                 default:
                     throw new NotSupportedException($"Task type '{task.Type}' is not supported");
@@ -218,6 +304,9 @@ public class TaskManagerService : ITaskManagerService
         for (int i = 0; i < totalSeconds; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            
+            // Проверяем паузу
+            await WaitIfPausedAsync(task.Id, cancellationToken);
 
             var remaining = timeUntilAlarm - TimeSpan.FromSeconds(i);
             task.Progress = (int)((double)i / totalSeconds * 100);
@@ -322,6 +411,9 @@ public class TaskManagerService : ITaskManagerService
         for (int i = 1; i <= executionCount; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            
+            // Проверяем паузу
+            await WaitIfPausedAsync(task.Id, cancellationToken);
 
             task.Progress = i;
             task.Message = $"Запуск программы {i}/{executionCount}: {Path.GetFileName(executablePath)}";
@@ -396,7 +488,15 @@ public class TaskManagerService : ITaskManagerService
             // Ждем указанный интервал (кроме последней итерации)
             if (i < executionCount)
             {
-                await Task.Delay(TimeSpan.FromSeconds(intervalSeconds), cancellationToken);
+                // Во время ожидания также проверяем паузу
+                var delayRemaining = intervalSeconds;
+                while (delayRemaining > 0 && !cancellationToken.IsCancellationRequested)
+                {
+                    await WaitIfPausedAsync(task.Id, cancellationToken);
+                    var delayStep = Math.Min(1, delayRemaining); // Проверяем каждую секунду
+                    await Task.Delay(TimeSpan.FromSeconds(delayStep), cancellationToken);
+                    delayRemaining -= delayStep;
+                }
             }
         }
 
@@ -423,11 +523,24 @@ public class TaskManagerService : ITaskManagerService
             for (int i = 0; i < delaySteps; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                
+                // Проверяем паузу
+                await WaitIfPausedAsync(task.Id, cancellationToken);
+                
                 task.Progress = (int)((i + 1) * 100.0 / delaySteps);
                 var remaining = delayBeforeStart - (int)((i + 1) * stepDelay);
                 task.Message = $"Ожидание запуска... Осталось: {remaining} секунд";
                 await NotifyTaskUpdateAsync(task);
-                await Task.Delay(TimeSpan.FromSeconds(stepDelay), cancellationToken);
+                
+                // Во время ожидания проверяем паузу
+                var delayRemaining = stepDelay;
+                while (delayRemaining > 0 && !cancellationToken.IsCancellationRequested)
+                {
+                    await WaitIfPausedAsync(task.Id, cancellationToken);
+                    var delayStep = Math.Min(0.1, delayRemaining); // Проверяем каждые 100мс
+                    await Task.Delay(TimeSpan.FromSeconds(delayStep), cancellationToken);
+                    delayRemaining -= delayStep;
+                }
             }
         }
 
@@ -478,6 +591,9 @@ public class TaskManagerService : ITaskManagerService
             for (int i = 0; i < durationSteps; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                
+                // Проверяем паузу
+                await WaitIfPausedAsync(task.Id, cancellationToken);
 
                 // Проверяем, не завершился ли процесс сам
                 try
@@ -504,7 +620,15 @@ public class TaskManagerService : ITaskManagerService
                 task.Message = $"Программа работает... Закроется через: {remaining} секунд";
                 await NotifyTaskUpdateAsync(task);
 
-                await Task.Delay(TimeSpan.FromSeconds(durationStepDelay), cancellationToken);
+                // Во время ожидания проверяем паузу
+                var delayRemaining = durationStepDelay;
+                while (delayRemaining > 0 && !cancellationToken.IsCancellationRequested)
+                {
+                    await WaitIfPausedAsync(task.Id, cancellationToken);
+                    var delayStep = Math.Min(0.1, delayRemaining); // Проверяем каждые 100мс
+                    await Task.Delay(TimeSpan.FromSeconds(delayStep), cancellationToken);
+                    delayRemaining -= delayStep;
+                }
             }
 
             // Закрываем программу
@@ -781,6 +905,269 @@ public class TaskManagerService : ITaskManagerService
                     catch { }
                 }
                 process.Dispose();
+            }
+        }
+    }
+
+    private async Task RunRabbitMqTaskAsync(BackgroundTask task, Dictionary<string, string> parameters, CancellationToken cancellationToken)
+    {
+        var queueName = parameters.GetValueOrDefault("queueName", "test_queue");
+        var message = parameters.GetValueOrDefault("message", string.Empty);
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            throw new ArgumentException("Параметр 'message' обязателен для отправки сообщения в RabbitMQ");
+        }
+
+        // Параметры для повторной отправки
+        var executionCount = int.TryParse(parameters.GetValueOrDefault("executionCount", "1"), out var count) ? count : 1;
+        var intervalSeconds = int.TryParse(parameters.GetValueOrDefault("intervalSeconds", "0"), out var interval) ? interval : 0;
+
+        if (executionCount < 1)
+        {
+            executionCount = 1;
+        }
+
+        task.MaxValue = executionCount;
+        task.Message = $"Отправка сообщения в очередь '{queueName}'...";
+        await NotifyTaskUpdateAsync(task);
+
+        var successfulSends = 0;
+        var failedSends = 0;
+
+        try
+        {
+            for (int i = 1; i <= executionCount; i++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                
+                // Проверяем паузу
+                await WaitIfPausedAsync(task.Id, cancellationToken);
+
+                task.Progress = i;
+                task.Message = $"Отправка сообщения {i}/{executionCount} в очередь '{queueName}'...";
+                await NotifyTaskUpdateAsync(task);
+
+                var success = await _rabbitMqService.PublishMessageAsync(queueName, message);
+                
+                if (success)
+                {
+                    successfulSends++;
+                    _logger.LogInformation("Задача {TaskId} отправила сообщение {Index}/{Count} в RabbitMQ очередь '{QueueName}'", 
+                        task.Id, i, executionCount, queueName);
+                }
+                else
+                {
+                    failedSends++;
+                    _logger.LogWarning("Задача {TaskId} не смогла отправить сообщение {Index}/{Count} в RabbitMQ очередь '{QueueName}'", 
+                        task.Id, i, executionCount, queueName);
+                }
+
+                // Ждем интервал перед следующей отправкой (кроме последней итерации)
+                if (i < executionCount && intervalSeconds > 0)
+                {
+                    // Во время ожидания также проверяем паузу
+                    var delayRemaining = intervalSeconds;
+                    while (delayRemaining > 0 && !cancellationToken.IsCancellationRequested)
+                    {
+                        await WaitIfPausedAsync(task.Id, cancellationToken);
+                        var delayStep = Math.Min(1, delayRemaining); // Проверяем каждую секунду
+                        await Task.Delay(TimeSpan.FromSeconds(delayStep), cancellationToken);
+                        delayRemaining -= delayStep;
+                    }
+                }
+            }
+
+            // Итоговое сообщение
+            if (failedSends == 0)
+            {
+                task.Message = $"Все сообщения ({successfulSends}) успешно отправлены в очередь '{queueName}'";
+            }
+            else if (successfulSends > 0)
+            {
+                task.Message = $"Отправлено: {successfulSends} успешно, {failedSends} с ошибками в очередь '{queueName}'";
+                task.ErrorMessage = $"Не удалось отправить {failedSends} сообщений. Убедитесь, что RabbitMQ сервер запущен.";
+            }
+            else
+            {
+                task.Status = Models.TaskStatus.Failed;
+                task.ErrorMessage = $"Не удалось отправить ни одного сообщения в очередь '{queueName}'. Убедитесь, что RabbitMQ сервер запущен.";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            task.Status = Models.TaskStatus.Cancelled;
+            task.Message = "Отправка сообщений отменена";
+            throw;
+        }
+        catch (Exception ex)
+        {
+            task.Status = Models.TaskStatus.Failed;
+            task.ErrorMessage = $"Ошибка при отправке сообщения: {ex.Message}";
+            _logger.LogError(ex, "Ошибка при отправке сообщения в RabbitMQ для задачи {TaskId}", task.Id);
+            throw;
+        }
+    }
+
+    private async Task RunRabbitMqConsumerTaskAsync(BackgroundTask task, Dictionary<string, string> parameters, CancellationToken cancellationToken)
+    {
+        var queueName = parameters.GetValueOrDefault("queueName", "test_queue");
+
+        if (string.IsNullOrWhiteSpace(queueName))
+        {
+            throw new ArgumentException("Параметр 'queueName' обязателен для подписки на очередь RabbitMQ");
+        }
+
+        task.Message = $"Подключение к очереди '{queueName}'...";
+        await NotifyTaskUpdateAsync(task);
+
+        IConnection? connection = null;
+        IModel? channel = null;
+
+        try
+        {
+            var factory = new ConnectionFactory
+            {
+                HostName = _configuration["RabbitMQ:HostName"] ?? "localhost",
+                Port = int.TryParse(_configuration["RabbitMQ:Port"], out var port) ? port : 5672,
+                UserName = _configuration["RabbitMQ:UserName"] ?? "guest",
+                Password = _configuration["RabbitMQ:Password"] ?? "guest",
+                VirtualHost = _configuration["RabbitMQ:VirtualHost"] ?? "/",
+                AutomaticRecoveryEnabled = true,
+                NetworkRecoveryInterval = TimeSpan.FromSeconds(10),
+                RequestedConnectionTimeout = TimeSpan.FromSeconds(5)
+            };
+
+            connection = factory.CreateConnection();
+            channel = connection.CreateModel();
+
+            // Сохраняем подключение для возможности закрытия при остановке задачи
+            _rabbitMqConnections[task.Id] = (connection, channel);
+
+            // Объявляем очередь (если не существует, будет создана)
+            channel.QueueDeclare(
+                queue: queueName,
+                durable: true,
+                exclusive: false,
+                autoDelete: false,
+                arguments: null
+            );
+
+            // Настраиваем QoS (качество обслуживания) - обрабатываем по одному сообщению за раз
+            channel.BasicQos(prefetchSize: 0, prefetchCount: 1, global: false);
+
+            task.Message = $"Слушаю очередь '{queueName}'. Ожидание сообщений...";
+            await NotifyTaskUpdateAsync(task);
+
+            _logger.LogInformation("Задача {TaskId} начала слушать очередь RabbitMQ '{QueueName}'", task.Id, queueName);
+
+            var consumer = new EventingBasicConsumer(channel);
+            var messagesReceived = 0;
+
+            consumer.Received += async (model, ea) =>
+            {
+                try
+                {
+                    // Проверяем паузу перед обработкой сообщения
+                    await WaitIfPausedAsync(task.Id, cancellationToken);
+                    
+                    var body = ea.Body.ToArray();
+                    var message = Encoding.UTF8.GetString(body);
+                    messagesReceived++;
+
+                    _logger.LogInformation("Задача {TaskId} получила сообщение из очереди '{QueueName}': {Message}", 
+                        task.Id, queueName, message);
+
+                    // Обновляем счетчик полученных сообщений
+                    task.Progress = messagesReceived;
+                    task.Message = $"Получено сообщений: {messagesReceived} из очереди '{queueName}'";
+                    await NotifyTaskUpdateAsync(task);
+
+                    // Создаем уведомление о получении сообщения
+                    await _notificationService.CreateNotificationAsync(
+                        title: $"Новое сообщение из очереди '{queueName}'",
+                        message: message,
+                        source: $"RabbitMQ: {queueName}",
+                        metadata: new Dictionary<string, object>
+                        {
+                            { "queueName", queueName },
+                            { "taskId", task.Id },
+                            { "messageNumber", messagesReceived }
+                        }
+                    );
+
+                    // Подтверждаем обработку сообщения
+                    channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Ошибка при обработке сообщения из очереди '{QueueName}' для задачи {TaskId}", queueName, task.Id);
+                    // Отклоняем сообщение и не возвращаем его в очередь
+                    channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
+                }
+            };
+
+            channel.BasicConsume(
+                queue: queueName,
+                autoAck: false, // Ручное подтверждение обработки
+                consumer: consumer
+            );
+
+            // Ждем до отмены
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                // Проверяем паузу
+                await WaitIfPausedAsync(task.Id, cancellationToken);
+                
+                await Task.Delay(1000, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            task.Status = Models.TaskStatus.Cancelled;
+            task.Message = $"Подписка на очередь '{queueName}' отменена";
+            _logger.LogInformation("Задача {TaskId} прекратила слушать очередь '{QueueName}'", task.Id, queueName);
+        }
+        catch (Exception ex)
+        {
+            task.Status = Models.TaskStatus.Failed;
+            task.ErrorMessage = $"Ошибка при подключении к очереди '{queueName}': {ex.Message}";
+            _logger.LogError(ex, "Ошибка при подключении к очереди RabbitMQ '{QueueName}' для задачи {TaskId}", queueName, task.Id);
+            throw;
+        }
+        finally
+        {
+            // Закрываем подключение
+            try
+            {
+                channel?.Close();
+                channel?.Dispose();
+                connection?.Close();
+                connection?.Dispose();
+                _rabbitMqConnections.TryRemove(task.Id, out _);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Ошибка при закрытии RabbitMQ подключения для задачи {TaskId}", task.Id);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ожидает, если задача на паузе
+    /// </summary>
+    private async Task WaitIfPausedAsync(string taskId, CancellationToken cancellationToken)
+    {
+        if (_pauseEvents.TryGetValue(taskId, out var pauseEvent))
+        {
+            // Если событие сброшено (задача на паузе), ждем его установки
+            if (!pauseEvent.IsSet)
+            {
+                // Ждем в цикле, проверяя отмену
+                while (!pauseEvent.IsSet && !cancellationToken.IsCancellationRequested)
+                {
+                    await Task.Delay(100, cancellationToken);
+                }
             }
         }
     }
