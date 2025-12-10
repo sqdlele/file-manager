@@ -52,7 +52,6 @@ dotnet run
 ### Системные уведомления Windows
 - В браузере (через Web Notifications API)
 - На рабочем столе Windows (через Windows Toast Notifications)
-- RabbitMQ для отправки и получения сообщений через очереди.
 
 
 #### Настройка rabbitmq
