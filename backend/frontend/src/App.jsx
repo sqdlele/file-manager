@@ -14,6 +14,8 @@ function App() {
   const [connection, setConnection] = useState(null)
   const [isConnected, setIsConnected] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [notificationSearchQuery, setNotificationSearchQuery] = useState('')
+  const [expandedNotifications, setExpandedNotifications] = useState(new Set())
   const [selectedTaskId, setSelectedTaskId] = useState(null)
   const [showCreateModal, setShowCreateModal] = useState(false)
   const [showDetailsModal, setShowDetailsModal] = useState(false)
@@ -477,7 +479,8 @@ function App() {
       'reminder': 'Напоминание',
       'scheduler': 'Планировщик задач',
       'process': 'Запуск процесса',
-      'rabbitmq': 'Отправить в RabbitMQ'
+      'rabbitmq': 'Отправить в RabbitMQ',
+      'rabbitmq_consumer': 'Слушать очередь RabbitMQ'
     }
     return typeMap[type] || type
   }
@@ -663,7 +666,14 @@ function App() {
 
       {activeTab === 'notifications' && (
       <div className="toolbar">
-        <div style={{ flex: 1 }}></div>
+        <div className="search-box" style={{ flex: 1 }}>
+          <input
+            type="text"
+            placeholder="Поиск по очереди, сообщению или источнику..."
+            value={notificationSearchQuery}
+            onChange={(e) => setNotificationSearchQuery(e.target.value)}
+          />
+        </div>
         {unreadCount > 0 && (
           <button 
             className="toolbar-button" 
@@ -839,14 +849,13 @@ function App() {
                         
                         if (isRunning) {
                           return (
-                            <>
+                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                               <button
                                 className="action-button"
                                 onClick={(e) => {
                                   e.stopPropagation()
                                   handlePauseTask(task.id)
                                 }}
-                                style={{ marginRight: '8px' }}
                               >
                                 Пауза
                               </button>
@@ -859,20 +868,19 @@ function App() {
                               >
                                 Завершить
                               </button>
-                            </>
+                            </div>
                           )
                         }
                         
                         if (isPaused) {
                           return (
-                            <>
+                            <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
                               <button
                                 className="action-button"
                                 onClick={(e) => {
                                   e.stopPropagation()
                                   handleResumeTask(task.id)
                                 }}
-                                style={{ marginRight: '8px' }}
                               >
                                 Возобновить
                               </button>
@@ -885,7 +893,7 @@ function App() {
                               >
                                 Завершить
                               </button>
-                            </>
+                            </div>
                           )
                         }
                         
@@ -917,50 +925,114 @@ function App() {
 
       {activeTab === 'notifications' && (
       <div className="table-container">
-        {notifications.length === 0 ? (
-          <div className="empty-state">
-            <div className="empty-state-icon"></div>
-            <div className="empty-state-text">Нет уведомлений</div>
-          </div>
-        ) : (
-          <div className="notifications-list">
-            {notifications.map(notification => (
-              <div 
-                key={notification.id} 
-                className={`notification-item ${!notification.isRead ? 'unread' : ''}`}
-                onClick={() => {
-                  if (!notification.isRead) {
-                    markAsRead(notification.id)
-                  }
-                }}
-              >
-                <div className="notification-header">
-                  <div className="notification-title-row">
-                    <h3 className="notification-title">{notification.title}</h3>
-                    {!notification.isRead && <span className="unread-dot"></span>}
-                  </div>
-                  <div className="notification-actions">
-                    <button
-                      className="notification-action-btn"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        deleteNotification(notification.id)
-                      }}
-                      title="Удалить"
-                    >
-                      ×
-                    </button>
-                  </div>
-                </div>
-                <div className="notification-message">{notification.message}</div>
-                <div className="notification-footer">
-                  <span className="notification-source">{notification.source || 'System'}</span>
-                  <span className="notification-date">{formatNotificationDate(notification.createdAt)}</span>
+        {(() => {
+          // Фильтруем уведомления по поисковому запросу
+          const filteredNotifications = notificationSearchQuery.trim() === ''
+            ? notifications
+            : notifications.filter(notification => {
+                const searchLower = notificationSearchQuery.toLowerCase()
+                const title = (notification.title || '').toLowerCase()
+                const message = (notification.message || '').toLowerCase()
+                const source = (notification.source || '').toLowerCase()
+                
+                return title.includes(searchLower) || 
+                       message.includes(searchLower) || 
+                       source.includes(searchLower)
+              })
+
+          if (filteredNotifications.length === 0) {
+            return (
+              <div className="empty-state">
+                <div className="empty-state-icon"></div>
+                <div className="empty-state-text">
+                  {notificationSearchQuery.trim() === '' 
+                    ? 'Нет уведомлений' 
+                    : `Не найдено уведомлений по запросу "${notificationSearchQuery}"`}
                 </div>
               </div>
-            ))}
-          </div>
-        )}
+            )
+          }
+
+          return (
+            <div className="notifications-list">
+              {filteredNotifications.map(notification => (
+                <div 
+                  key={notification.id} 
+                  className={`notification-item ${!notification.isRead ? 'unread' : ''}`}
+                  onClick={() => {
+                    if (!notification.isRead) {
+                      markAsRead(notification.id)
+                    }
+                  }}
+                >
+                  <div className="notification-header">
+                    <div className="notification-title-row">
+                      <h3 className="notification-title">{notification.title}</h3>
+                      {!notification.isRead && <span className="unread-dot"></span>}
+                    </div>
+                    <div className="notification-actions">
+                      <button
+                        className="notification-action-btn"
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          deleteNotification(notification.id)
+                        }}
+                        title="Удалить"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  </div>
+                  <div className="notification-message">
+                    {(() => {
+                      // Пытаемся определить, является ли сообщение JSON
+                      try {
+                        const parsed = JSON.parse(notification.message)
+                        const isExpanded = expandedNotifications.has(notification.id)
+                        return (
+                          <div className="notification-json-container">
+                            <button
+                              className="notification-expand-btn"
+                              onClick={(e) => {
+                                e.stopPropagation()
+                                const newExpanded = new Set(expandedNotifications)
+                                if (isExpanded) {
+                                  newExpanded.delete(notification.id)
+                                } else {
+                                  newExpanded.add(notification.id)
+                                }
+                                setExpandedNotifications(newExpanded)
+                              }}
+                            >
+                              <span className="notification-expand-icon">{isExpanded ? '▼' : '▶'}</span>
+                              <span>Данные</span>
+                            </button>
+                            {isExpanded && (
+                              <div className="notification-json">
+                                <pre className="notification-json-content">
+                                  {JSON.stringify(parsed, null, 2)}
+                                </pre>
+                              </div>
+                            )}
+                          </div>
+                        )
+                      } catch {
+                        // Если не JSON, показываем как обычный текст
+                        return <div className="notification-text">{notification.message}</div>
+                      }
+                    })()}
+                  </div>
+                  <div className="notification-footer">
+                    <div className="notification-source-badge">
+                      <span className="notification-source">{notification.source || 'System'}</span>
+                    </div>
+                    <span className="notification-date">{formatNotificationDate(notification.createdAt)}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )
+        })()}
       </div>
       )}
 

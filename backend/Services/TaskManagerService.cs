@@ -9,6 +9,7 @@ using Windows.Data.Xml.Dom;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
 using System.Text;
+using System.Linq;
 
 namespace TasksManager.Api.Services;
 
@@ -1018,7 +1019,18 @@ public class TaskManagerService : ITaskManagerService
             throw new ArgumentException("Параметр 'queueName' обязателен для подписки на очередь RabbitMQ");
         }
 
+        // Парсим максимальное количество сообщений (если указано)
+        int? maxMessages = null;
+        if (parameters.TryGetValue("maxMessages", out var maxMessagesStr) && 
+            int.TryParse(maxMessagesStr, out var maxMessagesValue) && 
+            maxMessagesValue > 0)
+        {
+            maxMessages = maxMessagesValue;
+            task.MaxValue = maxMessagesValue;
+        }
+
         task.Message = $"Подключение к очереди '{queueName}'...";
+        task.Progress = 0;
         await NotifyTaskUpdateAsync(task);
 
         IConnection? connection = null;
@@ -1056,13 +1068,18 @@ public class TaskManagerService : ITaskManagerService
             // Настраиваем QoS (качество обслуживания) - обрабатываем по одному сообщению за раз
             channel.BasicQos(prefetchSize: 0, prefetchCount: 1, global: false);
 
-            task.Message = $"Слушаю очередь '{queueName}'. Ожидание сообщений...";
+            var statusMessage = maxMessages.HasValue 
+                ? $"Слушаю очередь '{queueName}'. Ожидание сообщений (максимум: {maxMessages.Value})..."
+                : $"Слушаю очередь '{queueName}'. Ожидание сообщений...";
+            task.Message = statusMessage;
             await NotifyTaskUpdateAsync(task);
 
-            _logger.LogInformation("Задача {TaskId} начала слушать очередь RabbitMQ '{QueueName}'", task.Id, queueName);
+            _logger.LogInformation("Задача {TaskId} начала слушать очередь RabbitMQ '{QueueName}' (MaxMessages: {MaxMessages})", 
+                task.Id, queueName, maxMessages?.ToString() ?? "unlimited");
 
             var consumer = new EventingBasicConsumer(channel);
             var messagesReceived = 0; // Используем Interlocked для потокобезопасного инкремента
+            string? consumerTag = null;
 
             consumer.Received += async (model, ea) =>
             {
@@ -1082,8 +1099,31 @@ public class TaskManagerService : ITaskManagerService
 
                     // Обновляем счетчик полученных сообщений
                     task.Progress = currentCount;
-                    task.Message = $"Получено сообщений: {currentCount} из очереди '{queueName}'";
+                    
+                    var progressMessage = maxMessages.HasValue
+                        ? $"Получено сообщений: {currentCount}/{maxMessages.Value} из очереди '{queueName}'"
+                        : $"Получено сообщений: {currentCount} из очереди '{queueName}'";
+                    task.Message = progressMessage;
                     await NotifyTaskUpdateAsync(task);
+
+                    // Проверяем, достигнуто ли максимальное количество сообщений
+                    if (maxMessages.HasValue && currentCount >= maxMessages.Value)
+                    {
+                        _logger.LogInformation("Задача {TaskId} достигла максимального количества сообщений ({MaxMessages}). Завершение подписки.", 
+                            task.Id, maxMessages.Value);
+                        
+                        task.Status = Models.TaskStatus.Completed;
+                        task.CompletedAt = DateTime.UtcNow;
+                        task.Message = $"Обработано {currentCount} сообщений из очереди '{queueName}'. Задача завершена.";
+                        await NotifyTaskUpdateAsync(task);
+                        
+                        // Останавливаем потребление сообщений
+                        if (!string.IsNullOrEmpty(consumerTag))
+                        {
+                            channel.BasicCancel(consumerTag);
+                        }
+                        return;
+                    }
 
                     // Создаем уведомление о получении сообщения
                     await _notificationService.CreateNotificationAsync(
@@ -1109,14 +1149,14 @@ public class TaskManagerService : ITaskManagerService
                 }
             };
 
-            channel.BasicConsume(
+            consumerTag = channel.BasicConsume(
                 queue: queueName,
                 autoAck: false, // Ручное подтверждение обработки
                 consumer: consumer
             );
 
-            // Ждем до отмены
-            while (!cancellationToken.IsCancellationRequested)
+            // Ждем до отмены или завершения задачи
+            while (!cancellationToken.IsCancellationRequested && task.Status == Models.TaskStatus.Running)
             {
                 // Проверяем паузу
                 await WaitIfPausedAsync(task.Id, cancellationToken);
@@ -1142,10 +1182,26 @@ public class TaskManagerService : ITaskManagerService
             // Закрываем подключение
             try
             {
-                channel?.Close();
+                if (channel != null && !channel.IsClosed)
+                {
+                    try
+                    {
+                        channel.Close();
+                    }
+                    catch { } // Игнорируем ошибки, если уже закрыт
+                }
                 channel?.Dispose();
-                connection?.Close();
+                
+                if (connection != null && connection.IsOpen)
+                {
+                    try
+                    {
+                        connection.Close();
+                    }
+                    catch { } // Игнорируем ошибки, если уже закрыт
+                }
                 connection?.Dispose();
+                
                 _rabbitMqConnections.TryRemove(task.Id, out _);
             }
             catch (Exception ex)
